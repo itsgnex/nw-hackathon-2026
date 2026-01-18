@@ -183,6 +183,14 @@ http://127.0.0.1:5500/main2.html
 
 ---
 
+## 🧠 Architecture Note
+
+This system performs in-context document reasoning rather than retrieval-augmented generation (RAG).  
+Uploaded documents are passed directly to the language model in memory and are never chunked, embedded, or retrieved from storage.  
+This design prioritizes privacy and simplicity. RAG-based retrieval may be added in future versions.
+
+---
+
 ## ⚠️ Disclaimer
 
 This project is intended for **educational and hackathon demonstration purposes only**.
