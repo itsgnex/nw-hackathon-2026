@@ -101,7 +101,7 @@ def classify_intent(user_input: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Classify this query: {user_input}"}
             ],
-            model=os.getenv("GITHUB_MODEL", "gpt-4o"),
+            model=os.getenv("GITHUB_MODEL", "gpt-4.1"),
             temperature=0 # Absolute precision
         )
         
