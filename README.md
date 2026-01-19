@@ -68,6 +68,14 @@ nwHacks2026/
 ````
 
 ---
+## Demo
+
+![Demo 1](demo-pics/demo1.jpg)
+![Demo 2](demo-pics/demo2.jpg)
+![Demo 3](demo-pics/demo3.jpg)
+![Demo 4](demo-pics/demo4.jpg)
+
+---
 
 ## ⚙️ Installation
 
