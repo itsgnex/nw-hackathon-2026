@@ -2,16 +2,15 @@
 """
 legalassist_civix_test.py
 
-A minimal end-to-end test harness for your hackathon:
-- Pulls official docs from:
-  - BC Laws CiviX (XML) for BC legislation (rental/work/driving-law)
-  - PDFs (ICBC + Justice Laws) for driving manuals + immigration
-- Chunks + embeds them (local LLM embeddings, e.g., Ollama)
-- Stores chunks + vectors in SQLite
-- Answers questions using ONLY the stored doc chunks and prints Sources
+This script serves as a localized RAG (Retrieval-Augmented Generation) engine. 
+It differs from the main bot by focusing on local LLM models (via Ollama) and 
+structured data ingestion from official BC Laws (XML) and federal PDFs.
 
-Prereqs:
-  pip install requests pypdf
+Core Workflow:
+1. Ingest: Pulls data from official URLs (XML/PDF).
+2. Process: Chunks the text and generates vector embeddings.
+3. Store: Saves everything in a local SQLite database for persistence.
+4. Query: Performs vector-based similarity search to answer user questions using only the local vault.
 
 Local LLM (recommended: Ollama):
   - chat model: mistral:7b (or any)
@@ -59,19 +58,22 @@ from pypdf import PdfReader
 
 
 # ----------------------------
-# Config
+# Environment & Model Config
 # ----------------------------
 
+# Default to local Ollama endpoints. You can override these via .env for production models.
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 LLM_CHAT_MODEL = os.getenv("LLM_CHAT_MODEL", "mistral:latest")
 LLM_EMBED_MODEL = os.getenv("LLM_EMBED_MODEL", "nomic-embed-text:latest")
 DB_PATH = os.getenv("DB_PATH", "legalassist_test.db")
 
-TOP_K = 6
-MIN_SIMILARITY = 0.18  # raise to be stricter, lower to be more permissive
+# Retrieval parameters
+TOP_K = 6             # How many context chunks to feed the model
+MIN_SIMILARITY = 0.18 # Similarity floor (adjust based on embedding model sensitivity)
 
 
-# Official sources (hackathon starter set)
+# Official data sources for the hackathon MVP.
+# We explicitly map titles to their XML/PDF locations.
 SOURCES: Dict[str, List[dict]] = {
     "rental": [
         {
@@ -160,7 +162,8 @@ def _post_json(url: str, payload: dict, timeout_s: int = 180) -> dict:
 
 def llm_embed_one(text: str) -> List[float]:
     """
-    Uses local embeddings endpoint (Ollama: /api/embeddings).
+    Calls the local embedding model. 
+    This turns a block of text into a high-dimensional vector for comparison.
     """
     data = _post_json(
         f"{LLM_BASE_URL}/api/embeddings",
@@ -216,6 +219,11 @@ def db_connect() -> sqlite3.Connection:
 
 
 def db_init(conn: sqlite3.Connection) -> None:
+    """
+    Set up the SQLite table for storing document chunks.
+    Note: We store the embedding vector as a JSON string since SQLite doesn't 
+    have a native vector type out of the box (we're calculating similarity in Python).
+    """
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chunks (
@@ -276,6 +284,10 @@ def db_load_category(conn: sqlite3.Connection, category: str) -> List[Chunk]:
 # ----------------------------
 
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """
+    Measures the 'closeness' of two vectors. 
+    A value closer to 1.0 means the texts are meaning-aligned.
+    """
     if len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -299,6 +311,10 @@ def normalize_ws(s: str) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 1400, overlap: int = 200) -> List[str]:
+    """
+    Splits long documents into smaller parts that fit into an LLM context.
+    Overlap ensures we don't lose context between slices.
+    """
     text = normalize_ws(text)
     if len(text) <= max_chars:
         return [text] if text else []
@@ -378,31 +394,33 @@ def _findtext(elem: ET.Element, path: str) -> str:
 
 def civix_xml_to_sections(xml_bytes: bytes) -> List[Tuple[str, str]]:
     """
-    Returns [(locator, section_text), ...]
-    Locator tries to be: "s. <num>" or similar.
+    Specialized parser for BC Laws CiviX XML format.
+    It identifies 'bcl:section' elements to extract meaningful legal sections rather 
+    than just arbitrary blocks of text.
     """
     root = ET.fromstring(xml_bytes)
 
     sections = []
+    # CiviX uses a structured format where each section is clearly demarcated
     for sec in root.iterfind(".//bcl:section", namespaces=NSMAP):
         num = _findtext(sec, "./bcl:num")
         note = _findtext(sec, "./bcl:marginalnote")
-        # Collect all text within this section (excluding nested section numbers if any)
+        # Body includes all sub-paragraphs and clauses
         body = normalize_ws(" ".join(sec.itertext()))
-        # Body often repeats num/note; keep it but make it readable
+        
         header = ""
         if num:
             header += f"Section {num}"
         if note:
             header += f" — {note}" if header else note
-        # Keep a cleaner combined text:
+            
         combined = normalize_ws((header + "\n" + body).strip())
         if not combined:
             continue
         locator = f"s. {num}" if num else "section"
         sections.append((locator, combined))
 
-    # If we fail to find structured sections, fallback to whole-doc chunking
+    # If the XML is flatter than expected, fallback to raw chunking
     if not sections:
         plain = normalize_ws(" ".join(root.itertext()))
         for i, c in enumerate(chunk_text(plain, max_chars=1800, overlap=250), start=1):
@@ -460,6 +478,12 @@ def ingest_category(category: str) -> None:
 
 
 def answer_from_docs(category: str, question: str) -> None:
+    """
+    The RAG Query Flow:
+    1. Embed user question.
+    2. Rank all chunks in the category by cosine similarity.
+    3. Feed the top results into the LLM as 'context' to generate a grounded answer.
+    """
     conn = db_connect()
     db_init(conn)
 
@@ -468,6 +492,7 @@ def answer_from_docs(category: str, question: str) -> None:
         print(f"No chunks found for category '{category}'. Run: ingest {category}")
         return
 
+    # 1. Similarity Search
     q_emb = llm_embed_one(question)
     scored: List[Tuple[float, Chunk]] = []
     for c in chunks:
@@ -480,7 +505,8 @@ def answer_from_docs(category: str, question: str) -> None:
         print("Not found in the currently ingested documents for this category.")
         return
 
-    # Build deduped source labels
+    # 2. Context Building & Generation
+    # ... (rest of the source line logic)
     sources: List[Tuple[str, str, str]] = []  # (title, locator, url)
     seen = set()
     for sim, c in top:
@@ -490,7 +516,6 @@ def answer_from_docs(category: str, question: str) -> None:
         seen.add(key)
         sources.append(key)
 
-    # Provide context to the model
     source_lines = []
     for i, (title, locator, url) in enumerate(sources, start=1):
         source_lines.append(f"[S{i}] {title} ({locator})")
@@ -526,10 +551,10 @@ def answer_from_docs(category: str, question: str) -> None:
         print("Not found in the currently ingested documents for this category.")
         return
 
+    # 3. Output Output Formatting
     print(draft)
     print("\nSources:")
     for i, (title, locator, url) in enumerate(sources, start=1):
-        # For BC Laws docs, you can often add a section anchor in future (optional).
         print(f"- [S{i}] {title} ({locator}) — {url}")
 
     print(f"\n(took {dt:.1f}s, top similarity={top[0][0]:.3f})")

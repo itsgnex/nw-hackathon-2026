@@ -4,20 +4,26 @@ from openai import OpenAI
 from tavily import TavilyClient
 import datetime
 
+# Initial environment load to pull in GITHUB_TOKEN and TAVILY_API_KEY
 load_dotenv(override=True)
 
 # 1. Initialize Clients (One time only)
+# We use GitHub's inference API which is OpenAI-compatible
 client = OpenAI(
     base_url="https://models.inference.ai.azure.com",
     api_key=os.getenv("GITHUB_TOKEN"),
 )
-# Ensure TAVILY_API_KEY is in your .env
+# Tavily is used for real-time web search restricted to government domains
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 def get_agent_config(category: str) -> dict:
+    """
+    Generates the persona and system instructions for a specific legal domain.
+    """
     current_date = datetime.datetime.now().strftime("%B %Y")
     
-    # Mandating "Absolute Recency" over "Current Year Only"
+    # Core logic shared by all legal experts.
+    # We strictly mandate "Absolute Recency" because legal context can expire quickly.
     base_instructions = (
         f"Role: BC Legal Research Assistant. Current Date: {current_date}.\n"
         "STRICT OPERATIONAL DIRECTIVES:\n"
@@ -26,6 +32,7 @@ def get_agent_config(category: str) -> dict:
         "3. SOURCE MANDATE: Every response MUST conclude with a 'Source:' link using the exact URL provided in the context.\n"
     )
     
+    # Specialized instructions for different legal areas
     configs = {
         "rent": {
             "name": "RentExpert",
@@ -55,23 +62,25 @@ def get_agent_config(category: str) -> dict:
             )
         }
     }
+    # Fallback to RentExpert if classification is fuzzy
     return configs.get(category.lower(), configs["rent"])
 
 def get_context_from_db_or_api(query: str, category: str):
-   # We add "2026" and "2025" and "update" to the query string
-   
-    
+    """
+    Search the web for current legal documentation.
+    We limit the domains to official Canadian and BC government sites for accuracy.
+    """
     try:
         response = tavily.search(
             query=query, 
-            search_depth="advanced", # Use 'advanced' for legal queries
-            max_results=3,           # Get 3 results to let the LLM compare dates
+            search_depth="advanced", # Advanced depth gives better content extraction
+            max_results=3,           # We pull 3 results so the LLM can compare and pick the latest one
             include_domains=["canada.ca", "gov.bc.ca", "ircc.canada.ca"]
         )
         
         if response['results']:
             best_match = response['results'][0]
-            # Returning both text and the URL
+            # Content for context + URL for sourcing
             return best_match['content'], best_match['url']
             
     except Exception as e:
@@ -82,7 +91,8 @@ def get_context_from_db_or_api(query: str, category: str):
 
 def classify_intent(user_input: str) -> str:
     """
-    Analyzes the user's question and returns 'rent', 'work','immigration' or 'other.
+    Determines which legal department the user's question belongs to.
+    This routes the query to the correct system prompt.
     """
     try:
         system_prompt = (
@@ -101,32 +111,35 @@ def classify_intent(user_input: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Classify this query: {user_input}"}
             ],
-            model=os.getenv("GITHUB_MODEL", "gpt-4.1"),
+            model=os.getenv("GITHUB_MODEL", "gpt-4o"), # Using gpt-4o for high classification accuracy
             temperature=0 # Absolute precision
         )
         
-        # Extract the label and clean it
+        # Clean up the response to get just the keyword
         category = response.choices[0].message.content.strip().lower()
         
-        # Safety check: default to 'rent' if the AI gives a weird answer
         valid_categories = ["rent", "work", "immigration"]
         return category if category in valid_categories else "other"
     except Exception as e:
         print(f"Error in classify_intent: {str(e)}")
-        return "rent"  # Default fallback
-
+        return "rent"  # Safe default fallback
 
 def legal_bot_response(user_input: str, category: str):
-  
+    """
+    Main RAG (Retrieval-Augmented Generation) pipeline:
+    1. Retrieval: Get latest context from official sites.
+    2. Generation: Produce a structured answer based strictly on that context.
+    """
     try:
         config = get_agent_config(category)
         
-        # SEARCH QUERY: Force Tavily to look for the "latest update" or "current" status
+        # SEARCH QUERY: We pivot the search to look for 'latest' updates specifically.
         search_query = f"latest official BC {category} law update rules {user_input} site:gov.bc.ca OR site:canada.ca"
         
+        # Step 1: Context Retrieval
         context_text, source_url = get_context_from_db_or_api(search_query, category)
         
-        # REFINED LLM PROMPT: Forcing the "Most Recent" logic
+        # Step 2: Final prompt assembly with the injected context
         prompt_content = f"""
         CONTEXT DATA:
         {context_text}
@@ -142,6 +155,7 @@ def legal_bot_response(user_input: str, category: str):
         4. End the response with: Source: {source_url}
         """
 
+        # Step 3: Call the LLM with the specialist's persona
         response = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": config["instructions"]},
@@ -153,6 +167,6 @@ def legal_bot_response(user_input: str, category: str):
         
         return response.choices[0].message.content
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in legal_bot_response: {e}")
         raise
 
